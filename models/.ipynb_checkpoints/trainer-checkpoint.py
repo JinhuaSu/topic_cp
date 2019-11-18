@@ -3,9 +3,9 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as func
+# import torch.nn.functional as func
 from tensorboardX import SummaryWriter
-
+import torch.nn.functional as F
 import distributed
 # import onmt
 from models.reporter import ReportMgr
@@ -265,33 +265,63 @@ class Trainer(object):
             mask = batch.mask
             mask_cls = batch.mask_cls
             batch_size = src.size(0)
+            
             topic_label = batch.topic_pro
             ################################################### topic predict
             top_vec = self.model.bert(src, segs, mask)
             sents_vec = top_vec[torch.arange(top_vec.size(0)).unsqueeze(1), clss]
+            # b x n x m
             sents_vec = sents_vec * mask_cls[:, :, None].float()
+            
             #############################################################################
-            pre_label = self.model.topic_predictor(sents_vec).squeeze(-1)
+            # topic
+            doc_vec = self.model.doc_extractor(sents_vec, mask_cls)
+            pre_label = self.model.topic_predictor(doc_vec).squeeze(-1)
             topic_loss = self.loss(pre_label, topic_label.float())
             topic_loss = topic_loss.sum()
-            # ###############################
-            # # topic vector
-            topic_vec = topic_label.mm(self.model.topic_embedding).unsqueeze(1)
-            sents_vec = self.model.memory(sents_vec, topic_vec)
-            sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+            ##############
+            # version_2
+
+            # b x m x 1
+            topic_vec = topic_label.mm(self.model.topic_embedding).unsqueeze(-1)
+            # b x n
+            match_score = torch.matmul(sents_vec, doc_vec.unsqueeze(-1)).squeeze(-1)
+            sents_num = match_score.size(1)
+            sent_scores = F.softmax(match_score, dim=1)
+
+            # hinge loss
+            positive_score = sent_scores[labels.type(torch.uint8)].view(batch_size, -1, 1).expand((batch_size, -1, sents_num))
+            back_score = sent_scores.unsqueeze(1).expand((batch_size, 3, sents_num))
+            final_score = back_score - positive_score
+            final_score = torch.where(final_score < 0, torch.zeros_like(final_score), final_score)
             
-            loss = self.loss(sent_scores, labels.float())
-            loss = (loss * mask_cls.float()).sum()
-            (loss / loss.numel() + topic_loss / topic_loss.numel()).backward()
-            # key_memory
-#             sents_vec = self.model.key_memory(sents_vec, self.model.topic_word_emb)
-#             sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
-            # loss
-#             loss = self.loss(sent_scores, labels.float())
-#             loss = (loss * mask_cls.float()).sum()
-#             (loss / loss.numel()).backward()
+            unseen = labels.view((batch_size, 1, sents_num)).expand((batch_size, 3, sents_num)).type(torch.uint8)
+            unseen = ~unseen
+            final_score = (final_score * unseen.float()).sum(1)
+            
+            hinge_loss = (final_score * mask_cls.float()).sum()
+            (hinge_loss / hinge_loss.numel() + topic_loss / topic_loss.numel()).backward()
+
+            # version_1
+            # topic vector
+
+            # topic_vec = topic_label.mm(self.model.topic_embedding).unsqueeze(1)
+            # sents_vec = self.model.memory(sents_vec, topic_vec)
+            # sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+            #
+            # loss = self.loss(sent_scores, labels.float())
+            # loss = (loss * mask_cls.float()).sum()
+            # (loss / loss.numel() + topic_loss / topic_loss.numel()).backward()
             ###########################################################################
-            batch_stats = Statistics(float(loss.cpu().data.numpy()), normalization)
+            # # key_memory
+            # sents_vec = self.model.key_memory(sents_vec, self.model.topic_word_emb)
+            # sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+            # # loss
+            # loss = self.loss(sent_scores, labels.float())
+            # loss = (loss * mask_cls.float()).sum()
+            # (loss / loss.numel()).backward()
+            ###########################################################################
+            batch_stats = Statistics(float(hinge_loss.cpu().data.numpy()), normalization)
 
             total_stats.update(batch_stats)
             report_stats.update(batch_stats)
@@ -343,8 +373,8 @@ class Trainer(object):
                 # topic vector
                 topic_vec = pre_label.mm(self.model.topic_embedding).unsqueeze(1)
                 # interactive
-                sents_vec = self.model.memory(sents_vec, topic_vec)
-                sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+                match_score = torch.matmul(sents_vec, topic_vec).squeeze(-1)
+                sent_scores = F.softmax(match_score, dim=1)
                 # loss
                 loss = self.loss(sent_scores, labels.float())
                 loss = (loss * mask_cls.float()).sum()
@@ -421,10 +451,8 @@ class Trainer(object):
 
                             topic_vec = pre_label.mm(self.model.topic_embedding).unsqueeze(1)
                             # interactive
-
-                            sents_vec = self.model.memory(sents_vec, topic_vec)
-
-                            sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+                            match_score = torch.matmul(sents_vec, topic_vec).squeeze(-1)
+                            sent_scores = F.softmax(match_score, dim=1)
 
                             sent_scores = sent_scores + mask_cls.float()
                             sent_scores = sent_scores.cpu().data.numpy()
@@ -530,7 +558,7 @@ class Trainer(object):
                 with torch.no_grad():
                     for batch in test_iter:
                         self.count+=1
-                        if self.count > 10000:
+                        if self.count > 30000:
                             break
                         src = batch.src
                         labels = batch.labels

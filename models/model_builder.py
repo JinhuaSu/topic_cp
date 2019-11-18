@@ -352,6 +352,34 @@ class Key_memory(nn.Module):
         return memory_mat
 
 
+class Doc_extractor(nn.Module):
+    def __init__(self, hidden_dim, dropout, num_layers, device):
+        super(Doc_extractor, self).__init__()
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, dropout=dropout, num_layers=num_layers, batch_first=True, bidirectional=True)
+        self.project = nn.Linear(2*hidden_dim, hidden_dim)
+        self.to(device)
+        
+    def forward(self, sents_vec, mask_cls):
+        doc_vec = torch.mean(sents_vec, 1)
+        # sents_vec, hidden = self.lstm(sents_vec)
+        # sents_vec = sents_vec * mask_cls[:, :, None].float()
+        # doc_vec = sents_vec.sum(1)
+        # doc_vec = self.project(doc_vec)
+        return doc_vec
+
+
+class Topic_predictor(nn.Module):
+    def __init__(self, args, d_model, device, topic_num):
+        super(Topic_predictor, self).__init__()
+        self.project = nn.Linear(d_model, topic_num)
+        self.to(device)
+
+    def forward(self, doc_vec):
+        label = self.project(doc_vec).squeeze(-1)
+        label = F.softmax(label, dim=1)
+        return label
+
+    
 def clones(module, N):
     "Produce N identical layers."
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
@@ -370,9 +398,12 @@ class Summarizer(nn.Module):
         self.bert = Bert(args.temp_dir, load_pretrained_bert, bert_config)
         self.memory = Memory(device, 1, self.bert.model.config.hidden_size)
         self.key_memory = Key_memory(device, 1, self.bert.model.config.hidden_size, args.dropout)
-        self.topic_predictor = Topic_predictor(self.bert.model.config.hidden_size, device, topic_num,d_ex_type = args.d_ex_type)
+        self.doc_extractor = Doc_extractor(self.bert.model.config.hidden_size, args.dropout, 1, device)
+        self.topic_predictor = Topic_predictor(args, self.bert.model.config.hidden_size, device, topic_num)
+
         # self.topic_embedding = nn.Embedding(topic_num, self.bert.model.config.hidden_size)
         # todo transform to normal weight not embedding
+        
         self.topic_embedding, self.topic_word, self.topic_word_emb = self.get_embedding(self.bert.model.embeddings)
         self.topic_embedding.requires_grad = True
         self.topic_word_emb.requires_grad = True
@@ -419,7 +450,7 @@ class Summarizer(nn.Module):
         return sent_scores, mask_cls, top_vec
     # todo
     def get_embedding(self, embedding):
-        lda_model_tfidf = models.ldamodel.LdaModel.load('../models/sum_topic_10.model')
+        lda_model_tfidf = models.ldamodel.LdaModel.load('/home1/bqw/sum/sum_topic_10.model')
         topic = lda_model_tfidf.show_topics()
         embed_list = []
         topic_word = []
@@ -483,34 +514,6 @@ class Summarizer(nn.Module):
         # print('sent_pool:', sent_pool.size())
         return sent_pool
 
-
-class Doc_extractor(nn.Module):
-    def __init__(self,d_ex_type):
-        super(Doc_extractor, self).__init__()
-        self.d_ex_type = d_ex_type
-
-    def forward(self,sents_vec):
-        print(sents_vec.shape)
-        if self.d_ex_type == 'mean':
-            doc_vec = torch.mean(sents_vec, 1)
-        print(doc_vec.shape)
-        return doc_vec
-
-
-class Topic_predictor(nn.Module):
-    def __init__(self, d_model, device, topic_num,d_ex_type):
-        super(Topic_predictor, self).__init__()
-        self.project = nn.Linear(d_model, topic_num)
-        self.doc_extractor = Doc_extractor(d_ex_type)
-
-        self.to(device)
-
-    def forward(self, sents_vec):
-        doc_vec = self.doc_extractor(sents_vec)
-        label = self.project(doc_vec).squeeze(-1)
-        label = F.softmax(label, dim=1)
-        return label
-    
 
 # @torchsnooper.snoop()
 def sent_kmax(sents_vec, clss, clss_fw, device, doc_len):

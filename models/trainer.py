@@ -3,9 +3,9 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as func
+# import torch.nn.functional as func
 from tensorboardX import SummaryWriter
-
+import torch.nn.functional as F
 import distributed
 # import onmt
 from models.reporter import ReportMgr
@@ -265,33 +265,63 @@ class Trainer(object):
             mask = batch.mask
             mask_cls = batch.mask_cls
             batch_size = src.size(0)
+            
             topic_label = batch.topic_pro
             ################################################### topic predict
             top_vec = self.model.bert(src, segs, mask)
             sents_vec = top_vec[torch.arange(top_vec.size(0)).unsqueeze(1), clss]
+            # b x n x m
             sents_vec = sents_vec * mask_cls[:, :, None].float()
+            
             #############################################################################
-            pre_label = self.model.topic_predictor(sents_vec).squeeze(-1)
+            # topic
+            doc_vec = self.model.doc_extractor(sents_vec, mask_cls)
+            pre_label = self.model.topic_predictor(doc_vec).squeeze(-1)
             topic_loss = self.loss(pre_label, topic_label.float())
             topic_loss = topic_loss.sum()
-            # ###############################
-            # # topic vector
-            topic_vec = topic_label.mm(self.model.topic_embedding).unsqueeze(1)
-            sents_vec = self.model.memory(sents_vec, topic_vec)
-            sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+            ##############
+            # version_2
+
+            # b x m x 1
+            topic_vec = topic_label.mm(self.model.topic_embedding).unsqueeze(-1)
+            # b x n
+            match_score = torch.matmul(sents_vec, doc_vec.unsqueeze(-1)).squeeze(-1)
+            sents_num = match_score.size(1)
+            sent_scores = F.softmax(match_score, dim=1)
+
+            # hinge loss
+            positive_score = sent_scores[labels.type(torch.uint8)].view(batch_size, -1, 1).expand((batch_size, -1, sents_num))
+            back_score = sent_scores.unsqueeze(1).expand((batch_size, 3, sents_num))
+            final_score = back_score - positive_score
+            final_score = torch.where(final_score < 0, torch.zeros_like(final_score), final_score)
             
-            loss = self.loss(sent_scores, labels.float())
-            loss = (loss * mask_cls.float()).sum()
-            (loss / loss.numel() + topic_loss / topic_loss.numel()).backward()
-            # key_memory
-#             sents_vec = self.model.key_memory(sents_vec, self.model.topic_word_emb)
-#             sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
-            # loss
-#             loss = self.loss(sent_scores, labels.float())
-#             loss = (loss * mask_cls.float()).sum()
-#             (loss / loss.numel()).backward()
+            unseen = labels.view((batch_size, 1, sents_num)).expand((batch_size, 3, sents_num)).type(torch.uint8)
+            unseen = ~unseen
+            final_score = (final_score * unseen.float()).sum(1)
+            
+            hinge_loss = (final_score * mask_cls.float()).sum()
+            (hinge_loss / hinge_loss.numel() + topic_loss / topic_loss.numel()).backward()
+
+            # version_1
+            # topic vector
+
+            # topic_vec = topic_label.mm(self.model.topic_embedding).unsqueeze(1)
+            # sents_vec = self.model.memory(sents_vec, topic_vec)
+            # sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+            #
+            # loss = self.loss(sent_scores, labels.float())
+            # loss = (loss * mask_cls.float()).sum()
+            # (loss / loss.numel() + topic_loss / topic_loss.numel()).backward()
             ###########################################################################
-            batch_stats = Statistics(float(loss.cpu().data.numpy()), normalization)
+            # # key_memory
+            # sents_vec = self.model.key_memory(sents_vec, self.model.topic_word_emb)
+            # sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+            # # loss
+            # loss = self.loss(sent_scores, labels.float())
+            # loss = (loss * mask_cls.float()).sum()
+            # (loss / loss.numel()).backward()
+            ###########################################################################
+            batch_stats = Statistics(float(hinge_loss.cpu().data.numpy()), normalization)
 
             total_stats.update(batch_stats)
             report_stats.update(batch_stats)
@@ -318,6 +348,144 @@ class Trainer(object):
                     grads, float(1))
             self.optim.step()
 
+    def key_validate(self, valid_iter, step):
+        self.model.eval()
+        stats = Statistics()
+
+        with torch.no_grad():
+            for batch in valid_iter:
+                src = batch.src
+                labels = batch.labels
+                segs = batch.segs
+                clss = batch.clss
+                mask = batch.mask
+                mask_cls = batch.mask_cls
+                topic_label = batch.topic_pro
+                ################################################### topic predict
+                top_vec = self.model.bert(src, segs, mask)
+                sents_vec = top_vec[torch.arange(top_vec.size(0)).unsqueeze(1), clss]
+                sents_vec = sents_vec * mask_cls[:, :, None].float()
+                # key_memory
+                doc_vec = self.model.doc_extractor(sents_vec, mask_cls)
+                match_score = torch.matmul(sents_vec, doc_vec.unsqueeze(-1)).squeeze(-1)
+                sents_num = match_score.size(1)
+                sent_scores = F.softmax(match_score, dim=1)
+
+                # loss
+                loss = self.loss(sent_scores, labels.float())
+                loss = (loss * mask_cls.float()).sum()
+
+                batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
+                stats.update(batch_stats)
+            self._report_step(0, step, valid_stats=stats)
+            return stats
+
+    def key_test(self, test_iter, step, cal_lead=False, cal_oracle=False):
+        """ Validate model.
+            valid_iter: validate data iterator
+        Returns:
+            :obj:`nmt.Statistics`: validation loss statistics
+        """
+        # Set model in validating mode.
+        print('memory test')
+        def _get_ngrams(n, text):
+            ngram_set = set()
+            text_length = len(text)
+            max_index_ngram_start = text_length - n
+            for i in range(max_index_ngram_start + 1):
+                ngram_set.add(tuple(text[i:i + n]))
+            return ngram_set
+
+        def _block_tri(c, p):
+            tri_c = _get_ngrams(3, c.split())
+            for s in p:
+                tri_s = _get_ngrams(3, s.split())
+                if len(tri_c.intersection(tri_s))>0:
+                    return True
+            return False
+
+        if (not cal_lead and not cal_oracle):
+            self.model.eval()
+        stats = Statistics()
+
+        can_path = '%s_step%d.candidate'%(self.args.result_path,step)
+        gold_path = '%s_step%d.gold' % (self.args.result_path, step)
+        with open(can_path, 'w') as save_pred:
+            with open(gold_path, 'w') as save_gold:
+                with torch.no_grad():
+                    for batch in test_iter:
+                        self.count+=1
+                        if self.count > 30000:
+                            break
+                        src = batch.src
+                        labels = batch.labels
+                        segs = batch.segs
+                        clss = batch.clss
+                        mask = batch.mask
+                        mask_cls = batch.mask_cls
+                        topic_label = batch.topic_pro
+
+
+                        gold = []
+                        pred = []
+
+                        if (cal_lead):
+                            selected_ids = [list(range(batch.clss.size(1)))] * batch.batch_size
+                        elif (cal_oracle):
+                            selected_ids = [[j for j in range(batch.clss.size(1)) if labels[i][j] == 1] for i in
+                                            range(batch.batch_size)]
+                        else:
+                            ################################################### topic predict
+                            top_vec = self.model.bert(src, segs, mask)
+                            sents_vec = top_vec[torch.arange(top_vec.size(0)).unsqueeze(1), clss]
+                            sents_vec = sents_vec * mask_cls[:, :, None].float()
+                            # key_memory
+                            doc_vec = self.model.doc_extractor(sents_vec, mask_cls)
+                            match_score = torch.matmul(sents_vec, doc_vec.unsqueeze(-1)).squeeze(-1)
+                            sents_num = match_score.size(1)
+                            sent_scores = F.softmax(match_score, dim=1)
+
+                            #####################################################
+                            sent_scores = sent_scores + mask_cls.float()
+                            sent_scores = sent_scores.cpu().data.numpy()
+                            selected_ids = np.argsort(-sent_scores, 1)
+                        # selected_ids = np.sort(selected_ids,1)
+                        # selected_ids: torch.Size([5, 17])
+                        # select the top 3
+                        for i, idx in enumerate(selected_ids):
+                            _pred = []
+                            if (len(batch.src_str[i]) == 0):
+                                continue
+                            for j in selected_ids[i][:len(batch.src_str[i])]:
+                                if (j >= len(batch.src_str[i])):
+                                    continue
+                                candidate = batch.src_str[i][j].strip()
+                                if (self.args.block_trigram):
+                                    if (not _block_tri(candidate, _pred)):
+                                        _pred.append(candidate)
+                                else:
+                                    _pred.append(candidate)
+
+                                if ((not cal_oracle) and (not self.args.recall_eval) and len(_pred) == 3):
+                                    break
+
+                            _pred = '<q>'.join(_pred)
+                            if (self.args.recall_eval):
+                                _pred = ' '.join(_pred.split()[:len(batch.tgt_str[i].split())])
+
+                            pred.append(_pred)
+                            gold.append(batch.tgt_str[i])
+
+                        for i in range(len(gold)):
+                            save_gold.write(gold[i].strip() + '\n')
+                        for i in range(len(pred)):
+                            save_pred.write(pred[i].strip() + '\n')
+        if(step!=-1 and self.args.report_rouge):
+            rouges = test_rouge(self.args.temp_dir, can_path, gold_path)
+            logger.info('Rouges at step %d \n%s' % (step, rouge_results_to_str(rouges)))
+        self._report_step(0, step, valid_stats=stats)
+        return stats
+
     def topic_validate(self, valid_iter, step):
         self.model.eval()
         stats = Statistics()
@@ -343,8 +511,8 @@ class Trainer(object):
                 # topic vector
                 topic_vec = pre_label.mm(self.model.topic_embedding).unsqueeze(1)
                 # interactive
-                sents_vec = self.model.memory(sents_vec, topic_vec)
-                sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
+                match_score = torch.matmul(sents_vec, topic_vec).squeeze(-1)
+                sent_scores = F.softmax(match_score, dim=1)
                 # loss
                 loss = self.loss(sent_scores, labels.float())
                 loss = (loss * mask_cls.float()).sum()
@@ -421,143 +589,9 @@ class Trainer(object):
 
                             topic_vec = pre_label.mm(self.model.topic_embedding).unsqueeze(1)
                             # interactive
+                            match_score = torch.matmul(sents_vec, topic_vec).squeeze(-1)
+                            sent_scores = F.softmax(match_score, dim=1)
 
-                            sents_vec = self.model.memory(sents_vec, topic_vec)
-
-                            sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
-
-                            sent_scores = sent_scores + mask_cls.float()
-                            sent_scores = sent_scores.cpu().data.numpy()
-                            selected_ids = np.argsort(-sent_scores, 1)
-                        # selected_ids = np.sort(selected_ids,1)
-                        # selected_ids: torch.Size([5, 17])
-                        # select the top 3
-                        for i, idx in enumerate(selected_ids):
-                            _pred = []
-                            if (len(batch.src_str[i]) == 0):
-                                continue
-                            for j in selected_ids[i][:len(batch.src_str[i])]:
-                                if (j >= len(batch.src_str[i])):
-                                    continue
-                                candidate = batch.src_str[i][j].strip()
-                                if (self.args.block_trigram):
-                                    if (not _block_tri(candidate, _pred)):
-                                        _pred.append(candidate)
-                                else:
-                                    _pred.append(candidate)
-
-                                if ((not cal_oracle) and (not self.args.recall_eval) and len(_pred) == 3):
-                                    break
-
-                            _pred = '<q>'.join(_pred)
-                            if (self.args.recall_eval):
-                                _pred = ' '.join(_pred.split()[:len(batch.tgt_str[i].split())])
-
-                            pred.append(_pred)
-                            gold.append(batch.tgt_str[i])
-
-                        for i in range(len(gold)):
-                            save_gold.write(gold[i].strip() + '\n')
-                        for i in range(len(pred)):
-                            save_pred.write(pred[i].strip() + '\n')
-        if(step!=-1 and self.args.report_rouge):
-            rouges = test_rouge(self.args.temp_dir, can_path, gold_path)
-            logger.info('Rouges at step %d \n%s' % (step, rouge_results_to_str(rouges)))
-        self._report_step(0, step, valid_stats=stats)
-        return stats
-
-    def key_validate(self, valid_iter, step):
-        self.model.eval()
-        stats = Statistics()
-
-        with torch.no_grad():
-            for batch in valid_iter:
-                src = batch.src
-                labels = batch.labels
-                segs = batch.segs
-                clss = batch.clss
-                mask = batch.mask
-                mask_cls = batch.mask_cls
-                topic_label = batch.topic_pro
-                ################################################### topic predict
-                top_vec = self.model.bert(src, segs, mask)
-                sents_vec = top_vec[torch.arange(top_vec.size(0)).unsqueeze(1), clss]
-                sents_vec = sents_vec * mask_cls[:, :, None].float()
-                # key_memory
-                sents_vec = self.model.key_memory(sents_vec, self.model.topic_word_emb)
-                sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
-                # loss
-                loss = self.loss(sent_scores, labels.float())
-                loss = (loss * mask_cls.float()).sum()
-
-                batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
-                stats.update(batch_stats)
-            self._report_step(0, step, valid_stats=stats)
-            return stats
-
-    def key_test(self, test_iter, step, cal_lead=False, cal_oracle=False):
-        """ Validate model.
-            valid_iter: validate data iterator
-        Returns:
-            :obj:`nmt.Statistics`: validation loss statistics
-        """
-        # Set model in validating mode.
-        print('memory test')
-        def _get_ngrams(n, text):
-            ngram_set = set()
-            text_length = len(text)
-            max_index_ngram_start = text_length - n
-            for i in range(max_index_ngram_start + 1):
-                ngram_set.add(tuple(text[i:i + n]))
-            return ngram_set
-
-        def _block_tri(c, p):
-            tri_c = _get_ngrams(3, c.split())
-            for s in p:
-                tri_s = _get_ngrams(3, s.split())
-                if len(tri_c.intersection(tri_s))>0:
-                    return True
-            return False
-
-        if (not cal_lead and not cal_oracle):
-            self.model.eval()
-        stats = Statistics()
-
-        can_path = '%s_step%d.candidate'%(self.args.result_path,step)
-        gold_path = '%s_step%d.gold' % (self.args.result_path, step)
-        with open(can_path, 'w') as save_pred:
-            with open(gold_path, 'w') as save_gold:
-                with torch.no_grad():
-                    for batch in test_iter:
-                        self.count+=1
-                        if self.count > 10000:
-                            break
-                        src = batch.src
-                        labels = batch.labels
-                        segs = batch.segs
-                        clss = batch.clss
-                        mask = batch.mask
-                        mask_cls = batch.mask_cls
-                        topic_label = batch.topic_pro
-
-
-                        gold = []
-                        pred = []
-
-                        if (cal_lead):
-                            selected_ids = [list(range(batch.clss.size(1)))] * batch.batch_size
-                        elif (cal_oracle):
-                            selected_ids = [[j for j in range(batch.clss.size(1)) if labels[i][j] == 1] for i in
-                                            range(batch.batch_size)]
-                        else:
-                            ################################################### topic predict
-                            top_vec = self.model.bert(src, segs, mask)
-                            sents_vec = top_vec[torch.arange(top_vec.size(0)).unsqueeze(1), clss]
-                            sents_vec = sents_vec * mask_cls[:, :, None].float()
-                            # key_memory
-                            sents_vec = self.model.key_memory(sents_vec, self.model.topic_word_emb)
-                            sent_scores = self.model.encoder(sents_vec, mask_cls).squeeze(-1)
-                            #####################################################
                             sent_scores = sent_scores + mask_cls.float()
                             sent_scores = sent_scores.cpu().data.numpy()
                             selected_ids = np.argsort(-sent_scores, 1)

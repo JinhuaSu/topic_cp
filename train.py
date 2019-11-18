@@ -283,7 +283,7 @@ def memory_test(args, device_id, pt):
     model.load_cp(checkpoint)
     model.eval()
 
-    test_iter =data_loader.Dataloader(args, load_dataset(args, 'train', shuffle=False),
+    test_iter =data_loader.Dataloader(args, load_dataset(args, 'test', shuffle=False),
                                   args.batch_size, device,
                                   shuffle=False, is_test=True)
     trainer = build_trainer(args, device_id, model, None)
@@ -589,7 +589,6 @@ if __name__ == '__main__':
     parser.add_argument("-warmup_steps", default=8000, type=int)
     parser.add_argument("-max_grad_norm", default=0, type=float)
     parser.add_argument("-extract_num", default=5, type=int)
-    parser.add_argument("-d_ex_type", default='mean', type=str,choices = ['mean'])
 
     parser.add_argument("-save_checkpoint_steps", default=5, type=int)
     parser.add_argument("-accum_count", default=1, type=int)
@@ -600,7 +599,7 @@ if __name__ == '__main__':
 
 
 
-    parser.add_argument('-visible_gpus', default='0', type=str)
+    parser.add_argument('-visible_gpus', default='-1', type=str)
     parser.add_argument('-gpu_ranks', default='0', type=str)
     parser.add_argument('-log_file', default='../logs/cnndm.log')
     parser.add_argument('-dataset', default='')
